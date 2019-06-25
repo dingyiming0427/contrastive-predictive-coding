@@ -79,7 +79,7 @@ class CPCLayer(keras.layers.Layer):
         # Compute dot product among vectors
         preds, y_encoded = inputs
         dot_product = preds[:, :, None, :] * y_encoded # this should be broadcasted to N x T_pred x (negative_samples + 1) x code_size
-        ret = K.exp(K.sum(dot_product, axis=-1))
+        ret = K.sum(dot_product, axis=-1)
 
         return ret
 
