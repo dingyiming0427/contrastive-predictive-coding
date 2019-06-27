@@ -5,11 +5,13 @@ Oord, Aaron van den, Yazhe Li, and Oriol Vinyals.
 "Representation Learning with Contrastive Predictive Coding."
 arXiv preprint arXiv:1807.03748 (2018).
 '''
-from data_utils import SortedNumberGenerator
-from os.path import join, basename, dirname, exists
+from data_utils import SortedNumberGenerator, SumNumberGenerator, SkipNumberGenerator
+import os
 import keras
 from keras import backend as K
 import tensorflow as tf
+
+from training_utils import SaveEncoder, res_block, make_periodic_lr
 
 def cross_entropy_loss(y_true, y_pred):
     loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=y_true, logits=y_pred, dim=2)
@@ -39,14 +41,29 @@ def network_encoder(x, code_size):
 
     return x
 
+def network_encoder_resnet(x, code_size):
+    x = keras.layers.Conv2D(filters=64, kernel_size=3, strides=2, activation='relu')(x)
+    x = res_block(x, 64)
+    x = keras.layers.MaxPooling2D(pool_size=(2, 2), padding='same')(x)
+    x = res_block(x, 64)
+    x = keras.layers.MaxPooling2D(pool_size=(2, 2), padding='same')(x)
+    x = res_block(x, 64)
+    x = keras.layers.MaxPooling2D(pool_size=(2, 2), padding='same')(x)
+
+    x = keras.layers.Flatten()(x)
+    x = keras.layers.Dense(units=256, activation='relu')(x)
+    x = keras.layers.Dense(units=code_size, activation='linear', name='encoder_embedding')(x)
+    return x
+
 
 def network_autoregressive(x):
 
     ''' Define the network that integrates information along the sequence '''
 
     # x = keras.layers.GRU(units=256, return_sequences=True)(x)
-    # x = keras.layers.BatchNormalization()(x)
+
     x = keras.layers.GRU(units=256, return_sequences=False, name='ar_context')(x)
+    # x = keras.layers.BatchNormalization()(x)
 
     return x
 
@@ -96,13 +113,16 @@ def network_cpc(image_shape, terms, predict_terms, negative_samples, code_size, 
 
     # Define encoder model
     encoder_input = keras.layers.Input(image_shape)
-    encoder_output = network_encoder(encoder_input, code_size)
+    encoder_output = network_encoder_resnet(encoder_input, code_size)
     encoder_model = keras.models.Model(encoder_input, encoder_output, name='encoder')
     encoder_model.summary()
 
     # Define rest of model
     x_input = keras.layers.Input((terms, image_shape[0], image_shape[1], image_shape[2]))
     x_encoded = keras.layers.TimeDistributed(encoder_model)(x_input)
+    # If we want to ditch the RNN and stack the history instead, uncomment the following two lines of code
+    # context = keras.layers.Reshape((code_size * terms,))(x_encoded)
+    # context = keras.layers.Dense(512, activation='relu')(context)
     context = network_autoregressive(x_encoded)
     preds = network_prediction(context, code_size, predict_terms)
 
@@ -128,22 +148,46 @@ def network_cpc(image_shape, terms, predict_terms, negative_samples, code_size, 
     return cpc_model
 
 
-def train_model(epochs, batch_size, output_dir, code_size, lr=1e-4, terms=4, predict_terms=4, negative_samples=5, image_size=28, color=False):
+def train_model(epochs, batch_size, output_dir, code_size, task='sorted', lr=1e-4, terms=4, predict_terms=4, negative_samples=5, max_skip_step=2, image_size=28, color=False):
 
     # Prepare data
-    train_data = SortedNumberGenerator(batch_size=batch_size, subset='train', terms=terms,
-                                       negative_samples=negative_samples, predict_terms=predict_terms,
-                                       image_size=image_size, color=color, rescale=True)
-    validation_data = SortedNumberGenerator(batch_size=batch_size, subset='valid', terms=terms,
-                                            negative_samples=negative_samples, predict_terms=predict_terms,
-                                            image_size=image_size, color=color, rescale=True)
+    if task == 'sorted':
+        train_data = SortedNumberGenerator(batch_size=batch_size, subset='train', terms=terms,
+                                           negative_samples=negative_samples, predict_terms=predict_terms,
+                                           image_size=image_size, color=color, rescale=True)
+        validation_data = SortedNumberGenerator(batch_size=batch_size, subset='valid', terms=terms,
+                                                negative_samples=negative_samples, predict_terms=predict_terms,
+                                                image_size=image_size, color=color, rescale=True)
+    elif task == 'sum':
+        steps = list(range(1, max_skip_step + 1))
+        train_data = SumNumberGenerator(batch_size=batch_size, subset='train', terms=terms,
+                                           negative_samples=negative_samples, steps=steps,
+                                           image_size=image_size, color=color, rescale=True)
+        validation_data = SumNumberGenerator(batch_size=batch_size, subset='valid', terms=terms,
+                                                negative_samples=negative_samples, steps=steps,
+                                                image_size=image_size, color=color, rescale=True)
+    elif task == 'skip':
+        steps = list(range(1, max_skip_step + 1))
+        train_data = SkipNumberGenerator(batch_size=batch_size, subset='train', terms=terms,
+                                           negative_samples=negative_samples, predict_terms=predict_terms, steps=steps,
+                                           image_size=image_size, color=color, rescale=True)
+        validation_data = SkipNumberGenerator(batch_size=batch_size, subset='valid', terms=terms,
+                                                negative_samples=negative_samples, predict_terms=predict_terms, steps=steps,
+                                                image_size=image_size, color=color, rescale=True)
+    else:
+        raise NotImplementedError("Taks %s is not supported!" % task)
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     # Prepares the model
     model = network_cpc(image_shape=(image_size, image_size, 3), terms=terms, predict_terms=predict_terms,
                         negative_samples=negative_samples, code_size=code_size, learning_rate=lr)
 
     # Callbacks
-    callbacks = [keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=1/3, patience=2, min_lr=1e-4)]
+    callbacks = [#keras.callbacks.LearningRateScheduler(make_periodic_lr([5e-2, 5e-3, 5e-4]), verbose=1),
+                 keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=1/3, patience=4, min_lr=1e-5, verbose=1, min_delta=0.001),
+                 SaveEncoder(output_dir)]
 
     # Trains the model
     model.fit_generator(
@@ -158,24 +202,44 @@ def train_model(epochs, batch_size, output_dir, code_size, lr=1e-4, terms=4, pre
 
     # Saves the model
     # Remember to add custom_objects={'CPCLayer': CPCLayer} to load_model when loading from disk
-    model.save(join(output_dir, 'cpc.h5'))
-
-    # Saves the encoder alone
-    encoder = model.layers[1].layer
-    encoder.save(join(output_dir, 'encoder.h5'))
+    #
+    # model.save(os.path.join(output_dir, 'cpc.h5'))
+    #
+    # # Saves the encoder alone
+    # encoder = model.layers[1].layer
+    # encoder.save(os.path.join(output_dir, 'encoder.h5'))
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='Train CPC model')
+    parser.add_argument('task', type=str, help='the task CPC tries to complete')
+    parser.add_argument('terms', type=int, help='number of history terms taken into account')
+    parser.add_argument('predict_terms', type=int, help='number of future terms to predict')
+    parser.add_argument('negative_samples', type=int, help='number of negative samples')
+    parser.add_argument('--max_skip_step', type=int, default=2, help='maximum step size for skip task')
+    parser.add_argument('--epoch', type=int, default=10, help='number of epochs to train the model for')
+    parser.add_argument('--run_suffix', type=str, default='')
+
+    args = parser.parse_args()
+
+    output_dir = 'models/64x64'
+    exp_name = '%s_hist%d_fut%d_neg%d' % (args.task, args.terms, args.predict_terms, args.negative_samples)
+    if args.task == 'skip' or args.task == 'sum':
+        exp_name += '_skip%d' % args.max_skip_step + '_%s' % args.run_suffix
+    output_dir = os.path.join(output_dir, exp_name)
 
     train_model(
-        epochs=10,
+        epochs=args.epoch,
         batch_size=32,
-        output_dir='models/64x64',
+        output_dir=output_dir,
         code_size=128,
+        task=args.task,
         lr=1e-3,
-        terms=1,
-        predict_terms=1,
-        negative_samples=2,
+        terms=args.terms,
+        predict_terms=args.predict_terms,
+        negative_samples=args.negative_samples,
+        max_skip_step=args.max_skip_step,
         image_size=64,
         color=True
     )

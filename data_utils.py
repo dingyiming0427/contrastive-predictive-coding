@@ -225,6 +225,188 @@ class MnistGenerator(object):
 
         return x, y_h
 
+class SkipNumberGenerator(object):
+    def __init__(self, batch_size, subset, terms, negative_samples=1, predict_terms=1, steps=[1, 2], image_size=28, color=False, rescale=True):
+
+        # Set params
+        self.negative_samples = negative_samples
+        self.predict_terms = predict_terms
+        self.steps = steps
+        self.batch_size = batch_size
+        self.subset = subset
+        self.terms = terms
+        self.image_size = image_size
+        self.color = color
+        self.rescale = rescale
+
+        # Initialize MNIST dataset
+        self.mnist_handler = MnistHandler()
+        self.n_samples = self.mnist_handler.get_n_samples(subset) // terms
+        self.n_batches = self.n_samples // batch_size
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.next()
+
+    def __len__(self):
+        return self.n_batches
+
+    def next(self):
+
+        # Build sentences
+        image_labels = np.zeros((self.batch_size, self.terms + (self.negative_samples + 1) * self.predict_terms))
+
+        for b in range(self.batch_size):
+
+            # Set ordered predictions for positive samples
+            seed = np.random.randint(0, 10)
+            step = np.random.choice(self.steps)
+            sentence = np.mod(np.arange(seed, seed + (self.terms + self.predict_terms) * step, step), 10)
+            assert(len(sentence) == self.terms + self.predict_terms)
+
+            # Set random predictions for negative samples
+            # Each predicted term draws a number from a distribution that excludes itself
+            numbers = np.arange(0, 10)
+            positive_terms = sentence[self.terms:]
+            negative_terms = np.zeros((self.negative_samples, self.predict_terms)).astype('int32')
+            for i, p in enumerate(positive_terms):
+                negative_terms[:, i] = np.random.choice(numbers[numbers != p], self.negative_samples)
+
+            # sentence[-self.predict_terms:] = np.mod(predicted_terms, 10)
+
+            # Save sentence
+            image_labels[b, :] = np.concatenate([sentence[:self.terms], positive_terms, negative_terms.reshape(-1)])
+
+
+        # Retrieve actual images
+        images, _ = self.mnist_handler.get_batch_by_labels(self.subset, image_labels.flatten(), self.image_size, self.color, self.rescale)
+
+        # Assemble batch
+        images = images.reshape((self.batch_size, self.terms + (self.negative_samples + 1) * self.predict_terms,
+                                 images.shape[1], images.shape[2], images.shape[3]))
+        x_images = images[:, :self.terms, ...]
+        y_images = images[:, self.terms:, ...]
+        y_images_splitted = np.split(y_images, self.negative_samples+1, axis=1)
+        y_images = np.stack(y_images_splitted, axis=2) # axis=0 is batch, axis=1 is temporal, axis=2 is negative samples
+
+
+
+        pos_neg_label = np.zeros((self.batch_size, self.predict_terms, self.negative_samples+1)).astype('int32')
+        pos_neg_label[:, :, 0] = 1
+
+        # TODO: currently the position of the positive sample is always the same for the same batch
+        idxs = np.random.choice(pos_neg_label.shape[2], pos_neg_label.shape[2], replace=False)
+
+        return [x_images, y_images[:, :, idxs, ...]], pos_neg_label[:, :, idxs]
+
+
+
+class SumNumberGenerator(object):
+
+    ''' Data generator providing lists of sorted numbers '''
+
+    def __init__(self, batch_size, subset, terms, negative_samples=1, steps=[1, 2], image_size=28, color=False, rescale=True):
+
+        # Set params
+        self.negative_samples = negative_samples
+        self.predict_terms = 1
+        self.steps = steps
+        self.batch_size = batch_size
+        self.subset = subset
+        self.terms = terms
+        self.image_size = image_size
+        self.color = color
+        self.rescale = rescale
+
+        # Initialize MNIST dataset
+        self.mnist_handler = MnistHandler()
+        self.n_samples = self.mnist_handler.get_n_samples(subset) // terms
+        self.n_batches = self.n_samples // batch_size
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.next()
+
+    def __len__(self):
+        return self.n_batches
+
+    def next(self):
+
+        # Build sentences
+        image_labels = np.zeros((self.batch_size, self.terms + (self.negative_samples + 1) * self.predict_terms))
+        labels = np.zeros((self.batch_size, self.predict_terms, self.negative_samples + 1))
+        # sentence_labels = np.ones((self.batch_size, 1)).astype('int32')
+        # positive_samples_n = self.positive_samples
+        for b in range(self.batch_size):
+
+            # # Set ordered predictions for positive samples
+            # sentence = np.random.randint(0, 10, self.terms)
+            # sentence = np.concatenate([sentence, [np.mod(np.sum(sentence), 10)]])
+            seed = np.random.randint(0, 10)
+            step = np.random.choice(self.steps)
+            sentence = np.mod(np.arange(seed, seed + (self.terms + self.predict_terms) * step, step), 10)
+            assert (len(sentence) == self.terms + self.predict_terms)
+            sentence[-1] = np.mod(np.sum(sentence[:-1]), 10)
+
+
+            # Set random predictions for negative samples
+            # Each predicted term draws a number from a distribution that excludes itself
+            numbers = np.arange(0, 10)
+            positive_terms = sentence[self.terms:]
+            positive_negative_terms = np.zeros((self.negative_samples + 1, self.predict_terms)).astype('int32')
+            positive_negative_labels = np.zeros((self.negative_samples + 1, self.predict_terms)).astype('int32')
+            for i, p in enumerate(positive_terms):
+                neg = np.random.choice(numbers[numbers != p], self.negative_samples)
+                pos_neg = np.concatenate([[p], neg])
+                # randomize positive negatives
+                idxs = np.random.choice(self.negative_samples + 1, self.negative_samples + 1, replace=False)
+                pos_neg_randomized = pos_neg[idxs]
+                positive_negative_terms[:, i] = pos_neg_randomized
+
+                pos_neg_labels = np.zeros(self.negative_samples + 1)
+                pos_neg_labels[0] = 1
+                pos_neg_labels = pos_neg_labels[idxs]
+                positive_negative_labels[:, i] = pos_neg_labels
+            labels[b] = np.transpose(positive_negative_labels)
+
+            # sentence[-self.predict_terms:] = np.mod(predicted_terms, 10)
+
+            # Save sentence
+            image_labels[b, :] = np.concatenate([sentence[:self.terms], positive_negative_terms.reshape(-1)])
+
+            # Retrieve actual images
+        images, _ = self.mnist_handler.get_batch_by_labels(self.subset, image_labels.flatten(), self.image_size,
+                                                           self.color, self.rescale)
+
+        # Assemble batch
+        images = images.reshape((self.batch_size, self.terms + (self.negative_samples + 1) * self.predict_terms,
+                                 images.shape[1], images.shape[2], images.shape[3]))
+        x_images = images[:, :self.terms, ...]
+        y_images = images[:, self.terms:, ...]
+        y_images_splitted = np.split(y_images, self.negative_samples + 1, axis=1)
+        y_images = np.stack(y_images_splitted,
+                            axis=2)  # axis=0 is batch, axis=1 is temporal, axis=2 is negative samples
+
+        #
+        # from matplotlib import pyplot as plt
+        # for i in range(4):
+        #     plt.imshow(x_images[0][i])
+        #     plt.savefig('x%d' % i)
+        # for i in range(4):
+        #     for j in range(3):
+        #         plt.imshow(y_images[0][i][j])
+        #         plt.savefig('y%d_%d' % (i, j))
+
+        #
+        # pos_neg_label = np.zeros((self.batch_size, self.predict_terms, self.negative_samples+1)).astype('int32')
+        # pos_neg_label[:, :, 0] = 1
+
+        return [x_images, y_images], labels
+
 
 class SortedNumberGenerator(object):
 
@@ -260,6 +442,7 @@ class SortedNumberGenerator(object):
 
         # Build sentences
         image_labels = np.zeros((self.batch_size, self.terms + (self.negative_samples + 1) * self.predict_terms))
+        labels = np.zeros((self.batch_size, self.predict_terms, self.negative_samples + 1))
         # sentence_labels = np.ones((self.batch_size, 1)).astype('int32')
         # positive_samples_n = self.positive_samples
         for b in range(self.batch_size):
@@ -272,14 +455,27 @@ class SortedNumberGenerator(object):
             # Each predicted term draws a number from a distribution that excludes itself
             numbers = np.arange(0, 10)
             positive_terms = sentence[self.terms:]
-            negative_terms = np.zeros((self.negative_samples, self.predict_terms)).astype('int32')
+            positive_negative_terms = np.zeros((self.negative_samples + 1, self.predict_terms)).astype('int32')
+            positive_negative_labels = np.zeros((self.negative_samples + 1, self.predict_terms)).astype('int32')
             for i, p in enumerate(positive_terms):
-                negative_terms[:, i] = np.random.choice(numbers[numbers != p], self.negative_samples)
+                neg = np.random.choice(numbers[numbers != p], self.negative_samples)
+                pos_neg = np.concatenate([[p], neg])
+                # randomize positive negatives
+                idxs = np.random.choice(self.negative_samples + 1, self.negative_samples + 1, replace=False)
+                pos_neg_randomized = pos_neg[idxs]
+                positive_negative_terms[:, i] = pos_neg_randomized
+
+                pos_neg_labels = np.zeros(self.negative_samples + 1)
+                pos_neg_labels[0] = 1
+                pos_neg_labels = pos_neg_labels[idxs]
+                positive_negative_labels[:, i] = pos_neg_labels
+            labels[b] = np.transpose(positive_negative_labels)
+
 
             # sentence[-self.predict_terms:] = np.mod(predicted_terms, 10)
 
             # Save sentence
-            image_labels[b, :] = np.concatenate([sentence[:self.terms], positive_terms, negative_terms.reshape(-1)])
+            image_labels[b, :] = np.concatenate([sentence[:self.terms], positive_negative_terms.reshape(-1)])
 
 
         # Retrieve actual images
@@ -303,14 +499,12 @@ class SortedNumberGenerator(object):
         #         plt.imshow(y_images[0][i][j])
         #         plt.savefig('y%d_%d' % (i, j))
 
+        #
+        # pos_neg_label = np.zeros((self.batch_size, self.predict_terms, self.negative_samples+1)).astype('int32')
+        # pos_neg_label[:, :, 0] = 1
 
-        pos_neg_label = np.zeros((self.batch_size, self.predict_terms, self.negative_samples+1)).astype('int32')
-        pos_neg_label[:, :, 0] = 1
 
-        # TODO: currently the position of the positive sample is always the same for the same batch
-        idxs = np.random.choice(pos_neg_label.shape[2], pos_neg_label.shape[2], replace=False)
-
-        return [x_images, y_images[:, :, idxs, ...]], pos_neg_label[:, :, idxs]
+        return [x_images, y_images], labels
 
 
 class SameNumberGenerator(object):
@@ -402,12 +596,44 @@ def plot_sequences(x, y, labels=None, output_path=None):
     else:
         plt.show()
 
+def plot_seq(x, y, labels, name=''):
+    """
+    :param x: terms x image_size
+    :param y: predict_terms x (negative_samples + 1) x image_size
+    :param labels: predict_terms x (negative_samples + 1) x 1
+    """
+    n_batches = x.shape[0]
+    n_terms = x.shape[1]
+    predict_terms = 1
+    pos_neg_count = y.shape[2]
+    counter = 1
+    for n_b in range(n_batches):
+        for n_t in range(n_terms):
+            plt.subplot(n_batches, n_terms, counter)
+            plt.imshow(x[n_b, n_t, ...])
+            plt.axis('off')
+            counter += 1
+    plt.savefig(name + '_x')
+
+    plt.clf()
+
+    counter=1
+    for n_b in range(n_batches):
+        for n_neg in range(pos_neg_count):
+            ax = plt.subplot(n_batches, pos_neg_count, counter)
+            plt.imshow(y[n_b, 0, n_neg, ...])
+            plt.axis('off')
+            ax.set_title(labels[n_b, 0, n_neg])
+            counter += 1
+    plt.savefig(name+"_y")
+
 
 if __name__ == "__main__":
 
     # Test SortedNumberGenerator
-    ag = SortedNumberGenerator(batch_size=8, subset='train', terms=4, positive_samples=4, predict_terms=4, image_size=64, color=True, rescale=False)
+    ag = SumNumberGenerator(batch_size=8, subset='train', terms=2, negative_samples=4, steps=list(range(1, 11)), image_size=64, color=True, rescale=False)
+    #ag = SkipNumberGenerator(batch_size=8, subset='train', terms=2, predict_terms=1, negative_samples=4, steps=list(range(1, 11)), image_size=64, color=True, rescale=False)
     for (x, y), labels in ag:
-        plot_sequences(x, y, labels, output_path=r'resources/batch_sample_sorted.png')
+        plot_seq(x, y, labels, name='sum')
         break
 
